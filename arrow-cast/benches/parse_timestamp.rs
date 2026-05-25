@@ -19,27 +19,74 @@ use arrow_cast::parse::string_to_timestamp_nanos;
 use criterion::*;
 use std::hint;
 
-fn criterion_benchmark(c: &mut Criterion) {
-    let timestamps = [
-        "2020-09-08",
-        "2020-09-08T13:42:29",
-        "2020-09-08T13:42:29.190",
-        "2020-09-08T13:42:29.190855",
-        "2020-09-08T13:42:29.190855999",
-        "2020-09-08T13:42:29+00:00",
-        "2020-09-08T13:42:29.190+00:00",
-        "2020-09-08T13:42:29.190855+00:00",
-        "2020-09-08T13:42:29.190855999-05:00",
-        "2020-09-08T13:42:29.190855Z",
-    ];
+// Format variants ordered by complexity:
+//   bare date, no-tz, tz-Z, tz-offset, fractional variants
+const TIMESTAMPS: &[(&str, &str)] = &[
+    ("date_only",           "2020-09-08"),
+    ("no_frac_no_tz",       "2020-09-08T13:42:29"),
+    ("frac_ms_no_tz",       "2020-09-08T13:42:29.190"),
+    ("frac_us_no_tz",       "2020-09-08T13:42:29.190855"),
+    ("frac_ns_no_tz",       "2020-09-08T13:42:29.190855999"),
+    ("no_frac_tz_z",        "2020-09-08T13:42:29Z"),
+    ("no_frac_tz_offset",   "2020-09-08T13:42:29+00:00"),
+    ("frac_ms_tz_offset",   "2020-09-08T13:42:29.190+00:00"),
+    ("frac_us_tz_offset",   "2020-09-08T13:42:29.190855+00:00"),
+    ("frac_ns_tz_neg",      "2020-09-08T13:42:29.190855999-05:00"),
+    ("frac_us_tz_z",        "2020-09-08T13:42:29.190855Z"),
+    ("space_sep_no_tz",     "2020-09-08 13:42:29.190855"),
+];
 
-    for timestamp in timestamps {
-        let t = hint::black_box(timestamp);
-        c.bench_function(t, |b| {
+/// Per-format single-call bench (existing shape, keeps CI history).
+fn bench_single(c: &mut Criterion) {
+    for (name, ts) in TIMESTAMPS {
+        let t = hint::black_box(*ts);
+        c.bench_function(&format!("single/{name}"), |b| {
             b.iter(|| string_to_timestamp_nanos(t).unwrap());
         });
     }
 }
 
-criterion_group!(benches, criterion_benchmark);
+/// Bulk throughput bench: 10k pre-interleaved timestamps per Criterion iteration,
+/// reported as throughput in elements/s so Criterion prints GB/s and ns/elem.
+fn bench_bulk(c: &mut Criterion) {
+    // Build a 10k batch interleaving all format variants — prevents branch
+    // predictor from learning a single format.
+    const BATCH: usize = 10_000;
+    let corpus: Vec<&str> = (0..BATCH)
+        .map(|i| TIMESTAMPS[i % TIMESTAMPS.len()].1)
+        .collect();
+
+    let mut group = c.benchmark_group("bulk");
+    group.throughput(Throughput::Elements(BATCH as u64));
+    group.bench_function("mixed_formats", |b| {
+        b.iter(|| {
+            let mut sum: i64 = 0;
+            for ts in hint::black_box(corpus.as_slice()) {
+                sum = sum.wrapping_add(string_to_timestamp_nanos(ts).unwrap());
+            }
+            hint::black_box(sum)
+        });
+    });
+    group.finish();
+
+    // Per-format bulk groups (pure same-format batch) — measures the hot-path
+    // cost when a column is homogeneous (typical real CSV).
+    let mut group = c.benchmark_group("bulk_homogeneous");
+    group.throughput(Throughput::Elements(BATCH as u64));
+    for (name, ts) in TIMESTAMPS {
+        let batch: Vec<&str> = std::iter::repeat(*ts).take(BATCH).collect();
+        group.bench_function(*name, |b| {
+            b.iter(|| {
+                let mut sum: i64 = 0;
+                for t in hint::black_box(batch.as_slice()) {
+                    sum = sum.wrapping_add(string_to_timestamp_nanos(t).unwrap());
+                }
+                hint::black_box(sum)
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_single, bench_bulk);
 criterion_main!(benches);
