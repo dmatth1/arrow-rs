@@ -127,6 +127,14 @@ pub(crate) fn cast_string_to_timestamp<O: OffsetSizeTrait, T: ArrowTimestampType
     cast_options: &CastOptions,
 ) -> Result<ArrayRef, ArrowError> {
     let array = array.as_string::<O>();
+    // SIMD fast path: Timestamp(Nanosecond) in UTC over a homogeneous, fixed-length, null-free
+    // column of a supported RFC3339 format. Declines (falls through to the general parser) for
+    // anything it cannot guarantee matches it, so observable behaviour is unchanged.
+    if T::UNIT == arrow_schema::TimeUnit::Nanosecond && to_tz.is_none() {
+        if let Some(values) = crate::timestamp_simd::try_cast_to_timestamp_nanos::<O>(array) {
+            return Ok(Arc::new(arrow_array::TimestampNanosecondArray::from(values)));
+        }
+    }
     let out: PrimitiveArray<T> = match to_tz {
         Some(tz) => {
             let tz: Tz = tz.as_ref().parse()?;

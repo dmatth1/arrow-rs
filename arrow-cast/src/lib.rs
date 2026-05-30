@@ -27,6 +27,7 @@ pub mod cast;
 pub use cast::*;
 pub mod display;
 pub mod parse;
+mod timestamp_simd;
 #[cfg(feature = "prettyprint")]
 pub mod pretty;
 

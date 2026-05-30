@@ -88,5 +88,49 @@ fn bench_bulk(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_single, bench_bulk);
+/// Bulk `cast(StringArray -> Timestamp(Nanosecond))` throughput via the public API. A
+/// homogeneous, null-free, fixed-length column hits the SIMD fast path; a null-containing column
+/// of the same data declines to the general (chrono) path — so the two functions together show
+/// the fast-path speedup on the same workload.
+fn bench_cast(c: &mut Criterion) {
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, TimeUnit};
+
+    const N: usize = 8192;
+    let to = DataType::Timestamp(TimeUnit::Nanosecond, None);
+
+    // varied but same-format ("YYYY-MM-DDTHH:MM:SS.mmmZ", width 24) -> fixed stride -> fast path
+    let mut x: u64 = 0x1234567;
+    let strings: Vec<String> = (0..N)
+        .map(|_| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let yr = 2000 + (x >> 32) % 26;
+            let mo = 1 + (x >> 20) % 12;
+            let da = 1 + (x >> 8) % 28;
+            let hh = (x >> 40) % 24;
+            let mi = (x >> 16) % 60;
+            let se = (x >> 4) % 60;
+            let ms = (x >> 24) % 1000;
+            format!("{yr:04}-{mo:02}-{da:02}T{hh:02}:{mi:02}:{se:02}.{ms:03}Z")
+        })
+        .collect();
+    let homogeneous = StringArray::from(strings.clone());
+
+    // one null forces the whole array onto the general path (same data -> baseline cost)
+    let mut opt: Vec<Option<String>> = strings.into_iter().map(Some).collect();
+    opt[0] = None;
+    let fallback = StringArray::from(opt);
+
+    let mut group = c.benchmark_group("cast_string_to_timestamp_ns");
+    group.throughput(Throughput::Elements(N as u64));
+    group.bench_function("homogeneous_simd_fastpath", |b| {
+        b.iter(|| arrow_cast::cast(hint::black_box(&homogeneous), &to).unwrap())
+    });
+    group.bench_function("general_path_baseline", |b| {
+        b.iter(|| arrow_cast::cast(hint::black_box(&fallback), &to).unwrap())
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_single, bench_bulk, bench_cast);
 criterion_main!(benches);
